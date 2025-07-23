@@ -1,0 +1,6 @@
+__pycache__
+raw
+debug.log
+.processed.json
+data/vehicle-statistics.csv.gz
+viz/static/data
