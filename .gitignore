@@ -4,3 +4,4 @@ debug.log
 .processed.json
 data/vehicle-statistics.csv.gz
 viz/static/data
+data/vehicle-statistics.csv.zip

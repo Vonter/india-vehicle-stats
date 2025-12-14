@@ -1,18 +1,16 @@
 import polars as pl
-import pandas as pd
 import os
 from bs4 import BeautifulSoup
 import glob
 import calendar
 from pathlib import Path
 import logging
-import json
+import zipfile
 
 # Configuration
 RAW_DIR = "raw/"
 COMBINED_PARQUET = "data/vehicle-statistics.parquet"
-COMBINED_CSV = "data/vehicle-statistics.csv.gz"
-PROCESSED_FILES_JSON = ".processed.json"
+COMBINED_CSV = "data/vehicle-statistics.csv.zip"
 RTO_MAPPING_FILE = "raw/rtos.txt"
 METADATA_COLS = ['State', 'RTO', 'RTO Name', 'Year', 'Month']
 DATA_TYPES = {'permit_category': 'Permit Category', 'permit_purpose': 'Permit Purpose', 'permit_type': 'Permit Type', 'registration_class': 'Registration Class', 'registration_category': 'Registration Category', 'registration_fuel': 'Registration Fuel', 'registration_manufacturer': 'Registration Manufacturer', 'registration_standard': 'Registration Standard', 'revenue_fee': 'Revenue (Fee)', 'revenue_tax': 'Revenue (Tax)', 'transaction_transaction': 'Transaction'}
@@ -153,21 +151,6 @@ def get_dir_key(file_path):
     parts = file_path.split('/')
     return '/'.join(parts[1:4]) if len(parts) >= 4 else None
 
-def load_processed_counts(file_path=PROCESSED_FILES_JSON):
-    """Load the processed file counts from JSON."""
-    try:
-        return json.load(open(file_path)) if os.path.exists(file_path) else {}
-    except (json.JSONDecodeError, IOError) as e:
-        logger.error(f"Error loading processed counts: {e}")
-        return {}
-
-def save_processed_counts(counts, file_path=PROCESSED_FILES_JSON):
-    """Save the processed file counts to JSON."""
-    try:
-        json.dump(counts, open(file_path, 'w'), indent=2)
-    except Exception as e:
-        logger.error(f"Error saving processed counts: {e}")
-
 def process_directory_to_long_format(dir_files, rto_mapping=None):
     """Process all files in a directory and convert to long format."""
     data_by_type = {dtype: [] for dtype in DATA_TYPES.values()}
@@ -200,9 +183,8 @@ def process_directory_to_long_format(dir_files, rto_mapping=None):
     return (pl.concat(long_dfs) if long_dfs else None, successful_count)
 
 def main():
-    # Initialize directory and load processed counts
+    # Initialize directory
     Path(os.path.dirname(COMBINED_PARQUET)).mkdir(parents=True, exist_ok=True)
-    processed_counts = load_processed_counts()
     
     # Load RTO mapping
     rto_mapping = load_rto_mapping()
@@ -216,15 +198,11 @@ def main():
     # Process each directory
     all_processed_dfs = []
     for dir_key, dir_files in files_by_dir.items():
-        if processed_counts.get(dir_key, 0) >= len(dir_files):
-            logger.info(f"Directory {dir_key} already processed.")
-            continue
         logger.info(f"Processing {dir_key}")
         if dir_result := process_directory_to_long_format(dir_files, rto_mapping):
             dir_df, successful_count = dir_result
             if dir_df is not None:
                 all_processed_dfs.append(dir_df)
-                processed_counts[dir_key] = successful_count    
     if not all_processed_dfs:
         logger.info("No new data to process.") 
         return
@@ -241,11 +219,12 @@ def main():
     # Save to Parquet
     final_df.write_parquet(COMBINED_PARQUET)
 
-    # Save to compressed CSV
-    final_df.to_pandas().to_csv(COMBINED_CSV, compression='gzip')
-
-    # Save processed counts once at the end
-    save_processed_counts(processed_counts)
+    # Save to compressed CSV (zip format)
+    csv_temp = COMBINED_CSV.replace('.zip', '.csv')
+    final_df.write_csv(csv_temp)
+    with zipfile.ZipFile(COMBINED_CSV, 'w', zipfile.ZIP_DEFLATED) as archive:
+        archive.write(csv_temp, os.path.basename(csv_temp))
+    os.remove(csv_temp)
     
     logger.info("Processing completed!")
 

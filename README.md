@@ -7,7 +7,7 @@ Explore the dataset [here](https://india-vehicle-stats.pages.dev)
 ## Data
 
 * [vehicle-statistics.parquet](data/vehicle-statistics.parquet): Vehicle permit, registration, revenue and transaction statistics, as Parquet file.
-* [vehicle-statistics.csv.gz](https://github.com/Vonter/india-vehicle-stats/releases/latest/download/vehicle-statistics.csv.gz): Vehicle permit, registration, revenue and transaction statistics, as compressed CSV file.
+* [vehicle-statistics.csv.zip](https://github.com/Vonter/india-vehicle-stats/releases/latest/download/vehicle-statistics.csv.zip): Vehicle permit, registration, revenue and transaction statistics, as compressed CSV file.
 
 For more details, refer to the [DATA.md](DATA.md).
 

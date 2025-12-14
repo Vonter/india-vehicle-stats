@@ -9,6 +9,8 @@ from functools import wraps
 import argparse
 import json
 import traceback
+import time
+import re
 
 # Global variables
 BUTTONS = {}
@@ -59,18 +61,22 @@ ALL_PANELS = {
 }
 
 # Utility functions
-def setup_logger():
-    """Set up and configure the logger."""
+def setup_logger(debug=False):
+    """Set up and configure the logger.
+    
+    Args:
+        debug: If True, enable debug logging. If False, only log INFO and above.
+    """
     logger = logging.getLogger(__name__)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
     # Create handlers
     stdout_handler = logging.StreamHandler()
     file_handler = logging.FileHandler('debug.log')
 
     # Set levels for handlers
-    stdout_handler.setLevel(logging.INFO)
-    file_handler.setLevel(logging.DEBUG)
+    stdout_handler.setLevel(logging.DEBUG if debug else logging.INFO)
+    file_handler.setLevel(logging.DEBUG if debug else logging.INFO)
 
     # Create formatters
     stdout_formatter = logging.Formatter('%(levelname)s: %(message)s')
@@ -85,43 +91,16 @@ def setup_logger():
 
     return logger
 
-logger = setup_logger()
+logger = None  # Will be initialized in main
 
 # Custom exception for view expiration
 class ViewExpiredException(Exception):
     """Exception raised when the view state expires."""
     pass
 
-def find_and_delete_blank_files(directory="raw/"):
-    """Find and delete blank HTML files created due to missing month IDs."""
-    search_string = "<p>No data available - blank file created due to missing month ID.</p>"
-    deleted_count = 0
-    
-    # Ensure directory exists
-    if not os.path.exists(directory):
-        return deleted_count
-    
-    # Walk through all subdirectories
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith('.html'):
-                file_path = os.path.join(root, file)
-                
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                        
-                    if search_string in content:
-                        os.remove(file_path)
-                        logger.debug(f"Deleted: {file_path}")
-                        deleted_count += 1
-                except Exception as e:
-                    logger.error(f"Error processing {file_path}: {str(e)}")
-    
-    return deleted_count
-
 def parse_state_rtos(state_html):
     """Parse RTO options from state HTML response and save list of RTOs to raw/rtos.txt."""
+    # HTML fragments from AJAX responses are HTML, not XML
     soup = BeautifulSoup(state_html, 'html.parser')
     options = soup.find_all('option')[1:]  # Skip first placeholder option
     
@@ -213,22 +192,41 @@ def create_blank_html_file(file_suffix, state=None, rto=None, year=None, month=N
     with open(filepath, 'w', encoding='utf-8') as file:
         file.write(blank_html)
 
-def retry_on_view_expired():
-    """Decorator to retry functions when ViewExpiredException occurs."""
+def retry_on_view_expired(max_retries=3):
+    """Decorator to retry functions when ViewExpiredException occurs.
+    
+    Args:
+        max_retries: Maximum number of retry attempts (default: 3)
+    """
     def decorator(func):
         @wraps(func)
         def wrapper(self, *args, **kwargs):
             attempt = 0
-            while True:
+            while attempt < max_retries:
                 try:
                     return func(self, *args, **kwargs)
                 except ViewExpiredException:
                     attempt += 1
+                    if attempt >= max_retries:
+                        logger.error(
+                            f"{func.__name__} failed with ViewExpiredException after {max_retries} attempts"
+                        )
+                        raise
+                    
                     logger.warning(
                         f"{func.__name__} failed with ViewExpiredException. "
-                        f"Retrying (attempt {attempt})..."
+                        f"Retrying (attempt {attempt}/{max_retries})..."
                     )
+                    # Exponential backoff
+                    time.sleep(1 * attempt)
                     self._reset_session()
+                    # Re-initialize session after reset
+                    try:
+                        self.initialize()
+                    except Exception as e:
+                        logger.error(f"Failed to re-initialize session: {str(e)}")
+                        if attempt >= max_retries - 1:
+                            raise
             return False
         return wrapper
     return decorator
@@ -236,11 +234,29 @@ def retry_on_view_expired():
 class VahanFetcher:
     """Class to fetch vehicle registration data from Vahan dashboard."""
     
-    def __init__(self, completed_fetches=None, fetch_all=False):
-        """Initialize the VahanFetcher with default settings."""
+    def __init__(self, completed_fetches=None, fetch_all=False, 
+                 years_filter=None, months_filter=None, 
+                 states_filter=None, rtos_filter=None):
+        """Initialize the VahanFetcher with default settings.
+        
+        Args:
+            completed_fetches: Dictionary of completed fetches
+            fetch_all: If True, fetch all historical data
+            years_filter: List of years to fetch (e.g., ['2024', '2025']). None means all.
+            months_filter: List of months to fetch (e.g., ['JAN', 'FEB']). None means all.
+            states_filter: List of state codes to fetch (e.g., ['KA', 'MH']). None means all.
+            rtos_filter: Dictionary mapping state codes to lists of RTO codes to fetch.
+                        Format: {'KA': ['KA01', 'KA02'], 'MH': ['MH01']}. None means all.
+        """
         self.session = requests.Session()
+        # Set headers globally to match browser behavior
+        self._set_global_headers()
         self.viewstate = None
         self.current_date = datetime.datetime.now()
+        self.session_start_time = datetime.datetime.now()
+        # Session timeout is 15 minutes (900 seconds) based on page meta refresh
+        self.session_timeout = 900
+        self.last_request_time = None
         
         # Element IDs for various dashboard components
         self.buttons = {}
@@ -254,12 +270,144 @@ class VahanFetcher:
         self.months = {}
         self.completed_fetches = completed_fetches if completed_fetches is not None else {}
         self.fetch_all = fetch_all
+        
+        # Filter parameters - convert to sets for faster lookups
+        self.years_filter = set(years_filter) if years_filter else None
+        self.months_filter = set([m.upper() for m in months_filter]) if months_filter else None
+        self.states_filter = set(states_filter) if states_filter else None
+        # rtos_filter is already a dict of state -> set of RTOs from main
+        self.rtos_filter = rtos_filter if rtos_filter else None
     
-    def make_request(self, data_updates=None):
+    def _set_global_headers(self):
+        """Set global headers for all requests to match browser behavior."""
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:145.0) Gecko/20100101 Firefox/145.0',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': URL
+        })
+    
+    def _get_parser(self, content, content_type=None):
+        """Determine the appropriate parser for BeautifulSoup based on content.
+        
+        Args:
+            content: The content to parse (bytes or str)
+            content_type: Optional content type hint
+            
+        Returns:
+            Tuple of (parser_name, is_xml)
+        """
+        # Check content type header if available
+        if content_type:
+            if 'xml' in content_type.lower():
+                return 'xml', True
+            if 'html' in content_type.lower():
+                return 'html.parser', False
+        
+        # Check content itself
+        if isinstance(content, bytes):
+            content_str = content[:500].decode('utf-8', errors='ignore')
+        else:
+            content_str = str(content)[:500]
+        
+        # Check for XML indicators
+        if content_str.strip().startswith('<?xml') or '<partial-response>' in content_str:
+            return 'xml', True
+        
+        # Default to HTML parser
+        return 'html.parser', False
+    
+    def _make_request_with_timeout(self, method, url, timeout=30, **kwargs):
+        """Make a request with timeout handling and automatic retry on timeout.
+        
+        Args:
+            method: HTTP method ('get' or 'post')
+            url: URL to request
+            timeout: Timeout in seconds (default: 30)
+            **kwargs: Additional arguments to pass to requests method
+            
+        Returns:
+            Response object
+            
+        Raises:
+            requests.exceptions.Timeout: If request times out after retries
+            requests.exceptions.RequestException: For other request errors
+        """
+        max_retries = 2
+        retry_count = 0
+        
+        while retry_count <= max_retries:
+            try:
+                start_time = time.time()
+                
+                if method.lower() == 'get':
+                    response = self.session.get(url, timeout=timeout, **kwargs)
+                elif method.lower() == 'post':
+                    response = self.session.post(url, timeout=timeout, **kwargs)
+                else:
+                    raise ValueError(f"Unsupported HTTP method: {method}")
+                
+                elapsed = time.time() - start_time
+                
+                # Log if request took a long time
+                if elapsed > 10:
+                    logger.warning(f"{method.upper()} request to {url} took {elapsed:.2f} seconds")
+                
+                response.raise_for_status()
+                return response
+                
+            except requests.exceptions.Timeout:
+                retry_count += 1
+                if retry_count > max_retries:
+                    logger.error(f"{method.upper()} request to {url} timed out after {max_retries + 1} attempts")
+                    raise
+                else:
+                    wait_time = 2 * retry_count  # Exponential backoff
+                    logger.warning(f"{method.upper()} request to {url} timed out, retrying in {wait_time}s (attempt {retry_count}/{max_retries})...")
+                    time.sleep(wait_time)
+                    # Refresh session on timeout
+                    if retry_count == 1:
+                        try:
+                            self._refresh_session()
+                        except Exception as e:
+                            logger.warning(f"Failed to refresh session after timeout: {str(e)}")
+    
+    def _check_session_validity(self):
+        """Check if session is still valid and refresh if needed.
+        
+        The page auto-refreshes every 15 minutes (900 seconds), so we should
+        proactively refresh the session before it expires.
+        """
+        if self.last_request_time is None:
+            return True
+        
+        elapsed = (datetime.datetime.now() - self.last_request_time).total_seconds()
+        # Refresh session if more than 12 minutes have passed (80% of 15 min timeout)
+        if elapsed > (self.session_timeout * 0.8):
+            logger.debug(f"Session approaching timeout ({elapsed:.1f}s elapsed), refreshing...")
+            try:
+                self._refresh_session()
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to refresh session: {str(e)}")
+                return False
+        return True
+    
+    def _refresh_session(self):
+        """Refresh the session by re-initializing it."""
+        logger.debug("Refreshing session...")
+        self._reset_session()
+        self.initialize()
+        self.session_start_time = datetime.datetime.now()
+        self.last_request_time = datetime.datetime.now()
+    
+    def make_request(self, data_updates=None, retry_count=0):
         """Make a request to the Vahan dashboard with the given data updates.
         
         Args:
             data_updates: Dictionary of parameters to update in the request
+            retry_count: Internal counter for retry attempts
             
         Returns:
             Tuple of (response, new_viewstate)
@@ -268,6 +416,29 @@ class VahanFetcher:
             ViewExpiredException: If the session expires
             requests.exceptions.RequestException: For other request errors
         """
+        # Check session validity before making request
+        if not self._check_session_validity():
+            raise ViewExpiredException("Session refresh failed")
+        
+        # Validate viewstate before making request
+        if not self.viewstate:
+            logger.warning("No viewstate available, re-initializing session...")
+            self._refresh_session()
+        
+        # Add small delay between requests to avoid overwhelming the server
+        if self.last_request_time:
+            elapsed = (datetime.datetime.now() - self.last_request_time).total_seconds()
+            if elapsed < 0.5:  # Minimum 500ms between requests
+                time.sleep(0.5 - elapsed)
+        
+        # Set AJAX-specific headers for POST requests
+        post_headers = {
+            'Accept': 'application/xml, text/xml, */*; q=0.01',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Faces-Request': 'partial/ajax',
+            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+        }
+        
         base_data = {
             'javax.faces.partial.ajax': 'true',
             'masterLayout_formlogin': 'masterLayout_formlogin',
@@ -297,22 +468,59 @@ class VahanFetcher:
             logger.debug(f"Request data: {data_updates}")
         
         try:
-            response = self.session.post(URL, data=base_data, timeout=30)
-            response.raise_for_status()
+            # Use timeout-handled request method
+            response = self._make_request_with_timeout('post', URL, timeout=30, 
+                                                      data=base_data, headers=post_headers)
 
             logger.debug("Response: " + str(response.text))
+            
+            # Check if view has expired BEFORE extracting viewstate
+            if 'javax.faces.application.ViewExpiredException' in response.text:
+                logger.warning("ViewExpiredException detected in response")
+                if retry_count < 2:  # Allow up to 2 retries
+                    logger.info(f"Retrying request after session refresh (attempt {retry_count + 1})...")
+                    self._refresh_session()
+                    return self.make_request(data_updates, retry_count + 1)
+                raise ViewExpiredException("View state expired after retries")
             
             # Extract new viewstate from response
             new_viewstate = self._extract_viewstate(response.text)
             
-            # Check if view has expired
-            if 'javax.faces.application.ViewExpiredException' in response.text:
-                raise ViewExpiredException("View state expired")
+            # Validate extracted viewstate
+            if new_viewstate is None:
+                logger.warning("Failed to extract viewstate from response")
+                if retry_count < 1:  # One retry for viewstate extraction failure
+                    logger.info("Retrying request after session refresh...")
+                    self._refresh_session()
+                    return self.make_request(data_updates, retry_count + 1)
+                # If we still have the old viewstate, use it
+                if self.viewstate:
+                    logger.warning("Using previous viewstate")
+                    new_viewstate = self.viewstate
+                else:
+                    raise ViewExpiredException("Could not extract or maintain viewstate")
+            
+            # Update viewstate and request time
+            self.viewstate = new_viewstate
+            self.last_request_time = datetime.datetime.now()
                 
             return response, new_viewstate
             
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Request timed out after 30 seconds: {str(e)}")
+            if retry_count < 2:
+                logger.info(f"Retrying request after timeout (attempt {retry_count + 1})...")
+                time.sleep(2 * (retry_count + 1))  # Exponential backoff for timeouts
+                self._refresh_session()
+                return self.make_request(data_updates, retry_count + 1)
+            raise ViewExpiredException(f"Request timeout after retries: {str(e)}")
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed: {str(e)}")
+            if retry_count < 2:
+                logger.info(f"Retrying request after error (attempt {retry_count + 1})...")
+                time.sleep(1 * (retry_count + 1))  # Exponential backoff
+                self._refresh_session()
+                return self.make_request(data_updates, retry_count + 1)
             raise ViewExpiredException(f"Network error: {str(e)}")
 
     def _extract_viewstate(self, response_text):
@@ -322,17 +530,53 @@ class VahanFetcher:
             response_text: HTML response from the server
             
         Returns:
-            Extracted viewstate string or the current viewstate if not found
+            Extracted viewstate string or None if not found
         """
+        # Method 1: Extract from CDATA section (most common in AJAX responses)
         if '[CDATA[' in response_text and ']]' in response_text:
-            viewstate = response_text[
-                response_text.rfind("[CDATA["):response_text.rfind("]]")
-            ].lstrip("[CDATA[")
-            logger.debug("Successfully extracted new viewstate")
-            return viewstate
-        else:
-            logger.warning("Could not extract viewstate from response")
-            return self.viewstate  # Return current viewstate if extraction fails
+            try:
+                start_idx = response_text.rfind("[CDATA[")
+                end_idx = response_text.rfind("]]")
+                if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+                    viewstate = response_text[start_idx + 7:end_idx].strip()
+                    if viewstate:
+                        logger.debug("Successfully extracted new viewstate from CDATA")
+                        return viewstate
+            except Exception as e:
+                logger.debug(f"Error extracting viewstate from CDATA: {str(e)}")
+        
+        # Method 2: Extract from hidden input field in HTML/XML
+        try:
+            parser, _ = self._get_parser(response_text)
+            soup = BeautifulSoup(response_text, parser)
+            viewstate_input = soup.find('input', {'name': 'javax.faces.ViewState'})
+            if viewstate_input and viewstate_input.get('value'):
+                viewstate = viewstate_input['value']
+                logger.debug("Successfully extracted new viewstate from HTML/XML input")
+                return viewstate
+        except Exception as e:
+            logger.debug(f"Error extracting viewstate from HTML/XML: {str(e)}")
+        
+        # Method 3: Try regex pattern for viewstate in XML/HTML
+        try:
+            # Pattern for viewstate in various formats
+            patterns = [
+                r'<update id="javax\.faces\.ViewState"><!\[CDATA\[([^\]]+)\]\]></update>',
+                r'name="javax\.faces\.ViewState"[^>]*value="([^"]+)"',
+                r'id="[^"]*ViewState[^"]*"[^>]*value="([^"]+)"',
+            ]
+            for pattern in patterns:
+                match = re.search(pattern, response_text)
+                if match:
+                    viewstate = match.group(1)
+                    if viewstate:
+                        logger.debug("Successfully extracted new viewstate using regex")
+                        return viewstate
+        except Exception as e:
+            logger.debug(f"Error extracting viewstate using regex: {str(e)}")
+        
+        logger.warning("Could not extract viewstate from response")
+        return None  # Return None to indicate failure
 
     def make_base_request(self, source, render, state='-1', rto='-1'):
         """Make a base request with standard parameters.
@@ -359,7 +603,8 @@ class VahanFetcher:
             **state_param
         })
         
-        return response, new_viewstate
+        # make_request already updates self.viewstate, but return it for consistency
+        return response, self.viewstate
 
     @retry_on_view_expired()
     def initialize(self):
@@ -367,16 +612,44 @@ class VahanFetcher:
         logger.debug("Initializing session...")
         
         # Get initial page and viewstate
-        response = self.session.get(URL, timeout=30)
-        response.raise_for_status()
+        # For initial GET request, use HTML accept header
+        get_headers = {
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        }
+        # Use timeout-handled request method
+        response = self._make_request_with_timeout('get', URL, timeout=30, headers=get_headers)
         
-        soup = BeautifulSoup(response.content, 'html.parser')
-        viewstate_elem = soup.find('input', {'name': 'javax.faces.ViewState'})
+        # Parse the response to get soup for button extraction
+        parser, _ = self._get_parser(response.content, response.headers.get('Content-Type', ''))
+        soup = BeautifulSoup(response.content, parser)
         
-        if not viewstate_elem or not viewstate_elem.get('value'):
-            raise Exception("Could not find viewstate in initial page")
+        # Try to extract viewstate using multiple methods
+        viewstate = self._extract_viewstate(response.text)
+        
+        if not viewstate:
+            # Fallback: try parsing as HTML
+            viewstate_elem = soup.find('input', {'name': 'javax.faces.ViewState'})
             
-        self.viewstate = viewstate_elem['value']
+            if viewstate_elem and viewstate_elem.get('value'):
+                viewstate = viewstate_elem['value']
+            else:
+                # Last resort: try regex on raw content
+                patterns = [
+                    r'name="javax\.faces\.ViewState"[^>]*value="([^"]+)"',
+                    r'id="[^"]*ViewState[^"]*"[^>]*value="([^"]+)"',
+                ]
+                for pattern in patterns:
+                    match = re.search(pattern, response.text)
+                    if match:
+                        viewstate = match.group(1)
+                        break
+                
+                if not viewstate:
+                    raise Exception("Could not find viewstate in initial page")
+            
+        self.viewstate = viewstate
+        self.last_request_time = datetime.datetime.now()
+        self.session_start_time = datetime.datetime.now()
 
         # Extract button IDs from the page
         self._extract_button_ids(soup)
@@ -507,7 +780,7 @@ class VahanFetcher:
         logger.debug(f"Extracting year selection IDs for {category}...")
         
         try:
-            # Create soup from html_content
+            # Create soup from html_content (HTML fragments from XML responses)
             soup = BeautifulSoup(html_content, 'html.parser')
             
             # Find all year link groups in the panel
@@ -530,7 +803,7 @@ class VahanFetcher:
         logger.debug("Extracting month selection IDs...")
         
         try:
-            # Parse the HTML content
+            # Parse the HTML content (HTML fragments from XML responses)
             soup = BeautifulSoup(html_content, 'html.parser')
             
             # Find month links in the content
@@ -626,6 +899,16 @@ class VahanFetcher:
         html = root[0][0].text if root is not None and len(root) > 0 and len(root[0]) > 0 else ""
         rtos = parse_state_rtos(html)
         logger.debug(f"Found {len(rtos)} RTOs for state {state}")
+        
+        # Filter RTOs if rtos_filter is specified
+        if self.rtos_filter and state in self.rtos_filter:
+            rtos = [rto for rto in rtos if rto in self.rtos_filter[state]]
+            logger.debug(f"Filtered to {len(rtos)} RTOs for state {state}")
+        elif self.rtos_filter and state not in self.rtos_filter:
+            # If rtos_filter is specified but this state is not in it, skip all RTOs
+            logger.debug(f"Skipping state {state} (not in RTOs filter)")
+            return True
+        
         for rto in rtos:
             if is_fetch_completed(self.completed_fetches, state, rto):
                 logger.info(f"{state}-{rto} already completed.")
@@ -668,14 +951,27 @@ class VahanFetcher:
         # Process each data category
         for category in ['regn', 'trans', 'revenue', 'permit']:
             # If category is already completed for this RTO, skip
-            if is_fetch_completed(self.completed_fetches, state, rto, category=category):
+            if is_fetch_completed(self.completed_fetches, state, rto, category=category,
+                                 years_filter=self.years_filter,
+                                 months_filter=self.months_filter,
+                                 states_filter=self.states_filter,
+                                 rtos_filter=self.rtos_filter):
                 logger.info(f"{state}-{rto} {category} already completed.")
                 continue
 
-            # Process each year
-            for year in self.years[category].keys():
+            # Process each year - filter by years_filter if specified
+            years_to_process = self.years[category].keys()
+            if self.years_filter:
+                years_to_process = [y for y in years_to_process if y in self.years_filter]
+                logger.debug(f"Filtered to {len(years_to_process)} years for {state}-{rto} {category}")
+            
+            for year in years_to_process:
                 # If year is already completed for this category, skip
-                if is_fetch_completed(self.completed_fetches, state, rto, year=year, category=category):
+                if is_fetch_completed(self.completed_fetches, state, rto, year=year, category=category,
+                                     years_filter=self.years_filter,
+                                     months_filter=self.months_filter,
+                                     states_filter=self.states_filter,
+                                     rtos_filter=self.rtos_filter):
                     logger.info(f"{state}-{rto} {category} {year} already completed.")
                     continue
 
@@ -687,10 +983,17 @@ class VahanFetcher:
 
     @retry_on_view_expired()
     def fetch_year_data(self, state, rto, year, category):
-        """Fetch data for a specific year."""            
-        # If not fetch_all, only process current year
-        if not self.fetch_all and int(year) < self.current_date.year:
-            logger.debug(f"Skipping past year {year} for {state}-{rto} (use --fetch-all to fetch all years)")
+        """Fetch data for a specific year."""
+        # Filter by years_filter if specified
+        if self.years_filter and year not in self.years_filter:
+            logger.debug(f"Skipping year {year} for {state}-{rto} (not in filter)")
+            return True  # Return True to continue processing other years
+            
+        # If not fetch_all and years_filter is not explicitly set, only process current year
+        # (years_filter being set means user explicitly wants those years, so respect that)
+        if not self.fetch_all and self.years_filter is None and int(year) < self.current_date.year:
+            logger.debug(f"Skipping past year {year} for {state}-{rto} (use --fetch-all or --years to fetch other years)")
+            return True  # Return True to continue processing other years
             
         year_key = self.years[category].get(year)
         if not year_key:
@@ -735,6 +1038,11 @@ class VahanFetcher:
         for month in self.months.keys():
             processed_months.add(month)
             
+            # Filter by months_filter if specified
+            if self.months_filter and month not in self.months_filter:
+                logger.debug(f"Skipping month {year}-{month} for {state}-{rto} (not in filter)")
+                continue
+            
             # Skip future months in current year
             month_num = MONTHS.index(month) + 1
             if int(year) == self.current_date.year and month_num > self.current_date.month:
@@ -746,14 +1054,19 @@ class VahanFetcher:
                     self.completed_fetches = mark_completion(self.completed_fetches, state, rto, category, year, month)
                 continue
                 
-            # If not fetch_all, only process previous month of current year
-            if not self.fetch_all:
-                if int(year) == self.current_date.year and month_num != (self.current_date.month - 1):
-                    logger.debug(f"Skipping month {year}-{month} for {state}-{rto} (use --fetch-all to fetch all months)")
+            # If not fetch_all and months_filter is not explicitly set, only process current month of current year
+            # (months_filter being set means user explicitly wants those months, so respect that)
+            if not self.fetch_all and self.months_filter is None:
+                if int(year) == self.current_date.year and month_num != self.current_date.month:
+                    logger.debug(f"Skipping month {year}-{month} for {state}-{rto} (use --fetch-all or --months to fetch other months)")
                     continue
                 
             # Check if this month and category is already completed
-            if is_fetch_completed(self.completed_fetches, state, rto, year=year, month=month, category=category):
+            if is_fetch_completed(self.completed_fetches, state, rto, year=year, month=month, category=category,
+                                 years_filter=self.years_filter,
+                                 months_filter=self.months_filter,
+                                 states_filter=self.states_filter,
+                                 rtos_filter=self.rtos_filter):
                 logger.info(f"{state}-{rto} {year}-{month} {category} already completed.")
                 continue
                 
@@ -908,7 +1221,13 @@ class VahanFetcher:
         logger.info("Starting Vahan data fetching process")
         last_save_time = datetime.datetime.now()
         
-        for state in STATES:
+        # Filter states if states_filter is specified
+        states_to_process = STATES
+        if self.states_filter:
+            states_to_process = [s for s in STATES if s in self.states_filter]
+            logger.info(f"Filtered to {len(states_to_process)} states: {', '.join(states_to_process)}")
+        
+        for state in states_to_process:
             attempt = 0
             while True:
                 try:
@@ -955,6 +1274,8 @@ class VahanFetcher:
         # Close and recreate session
         self.session.close()
         self.session = requests.Session()
+        # Restore global headers
+        self._set_global_headers()
         
         # Reset state
         self.viewstate = None
@@ -966,6 +1287,8 @@ class VahanFetcher:
             'permit': {}
         }
         self.months = {}
+        self.session_start_time = datetime.datetime.now()
+        self.last_request_time = None
 
 def load_completed_fetches(file_path='.completed.json'):
     """Load the completed fetches from a JSON file.
@@ -1004,44 +1327,110 @@ def save_completed_fetches(completed_fetches, file_path='.completed.json'):
     except Exception as e:
         logger.error(f"Error saving completed fetches to {file_path}: {str(e)}")
 
-def is_fetch_completed(completed_fetches, state, rto, year=None, month=None, category=None):
-    """Check if a fetch has been completed.
+def is_fetch_completed(completed_fetches, state, rto, year=None, month=None, category=None,
+                       years_filter=None, months_filter=None, states_filter=None, rtos_filter=None):
+    """Check if a fetch has been completed based on what needs to be fetched.
     
     Uses a flattened key structure for faster lookups.
+    Considers filters to determine if something is truly complete.
+    
+    Args:
+        completed_fetches: Dictionary of completed fetches
+        state: State code
+        rto: RTO code
+        year: Year (optional)
+        month: Month (optional)
+        category: Category (optional)
+        years_filter: Set of years that need to be fetched (None = all)
+        months_filter: Set of months that need to be fetched (None = all)
+        states_filter: Set of states that need to be fetched (None = all)
+        rtos_filter: Dict mapping state to set of RTOs that need to be fetched (None = all)
     """
-    # Build key based on provided parameters
-    if rto and category and year and month:
-        key = f"{state}:{rto}:{category}:{year}:{month.upper()}"
+    # If state filter is specified and this state is not in it, consider it complete (we don't need it)
+    if states_filter and state not in states_filter:
+        return True
+    
+    # If RTO filter is specified and this RTO is not in it, consider it complete (we don't need it)
+    if rtos_filter and state in rtos_filter and rto not in rtos_filter[state]:
+        return True
+    
+    # Helper function to check if a specific month/category is complete
+    def _is_month_category_complete(y, m, cat):
+        """Check if a specific month/category combination is complete."""
+        key = f"{state}:{rto}:{cat}:{y}:{m.upper()}"
         if key in completed_fetches:
             return True
-        
-    if rto and category and year:
-        # Check if all months for this year in this category are complete
-        year_key = f"{state}:{rto}:{category}:{year}"
+        # Check if year-level completion exists
+        year_key = f"{state}:{rto}:{cat}:{y}"
         if year_key in completed_fetches:
             return True
-        
-    if rto and category:
-        # Check if entire category is marked complete
-        category_key = f"{state}:{rto}:{category}"
+        # Check if category-level completion exists
+        category_key = f"{state}:{rto}:{cat}"
         if category_key in completed_fetches:
             return True
-            
-    if rto and month and year:
-        # Check if all categories for this month are complete
-        all_categories = ['regn', 'trans', 'revenue', 'permit']
-        return all(f"{state}:{rto}:{cat}:{year}:{month.upper()}" in completed_fetches for cat in all_categories)
-        
-    if rto and year:
-        # Check if entire year is marked complete
-        all_categories = ['regn', 'trans', 'revenue', 'permit']
-        return all(f"{state}:{rto}:{cat}:{year}" in completed_fetches for cat in all_categories)
-    
-    if rto:
-        # Check if entire rto is marked complete
+        # Check if RTO-level completion exists
         rto_key = f"{state}:{rto}"
         if rto_key in completed_fetches:
             return True
+        return False
+    
+    # Determine what we need to check based on filters
+    # Convert to sets if they're lists (for consistency)
+    if years_filter is not None:
+        years_to_check = set(years_filter) if not isinstance(years_filter, set) else years_filter
+    else:
+        years_to_check = set(YEARS)
+    
+    if months_filter is not None:
+        months_to_check = set([m.upper() for m in months_filter]) if not isinstance(months_filter, set) else months_filter
+    else:
+        months_to_check = set(MONTHS)
+    
+    all_categories = ['regn', 'trans', 'revenue', 'permit']
+    
+    # Build key based on provided parameters
+    if rto and category and year and month:
+        # Check if this specific month/category is complete
+        return _is_month_category_complete(year, month, category)
+        
+    if rto and category and year:
+        # Check if all required months for this year in this category are complete
+        for m in months_to_check:
+            if not _is_month_category_complete(year, m, category):
+                return False
+        return True
+        
+    if rto and category:
+        # Check if entire category is marked complete for all required years/months
+        for y in years_to_check:
+            for m in months_to_check:
+                if not _is_month_category_complete(y, m, category):
+                    return False
+        return True
+            
+    if rto and month and year:
+        # Check if all categories for this month are complete
+        for cat in all_categories:
+            if not _is_month_category_complete(year, month, cat):
+                return False
+        return True
+        
+    if rto and year:
+        # Check if entire year is marked complete for all required months
+        for cat in all_categories:
+            for m in months_to_check:
+                if not _is_month_category_complete(year, m, cat):
+                    return False
+        return True
+    
+    if rto:
+        # Check if entire rto is marked complete for all required years/months
+        for cat in all_categories:
+            for y in years_to_check:
+                for m in months_to_check:
+                    if not _is_month_category_complete(y, m, cat):
+                        return False
+        return True
     
     return False
 
@@ -1213,23 +1602,78 @@ def mark_completion(completed_fetches, state, rto, category, year=None, month=No
 if __name__ == "__main__":
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Fetch vehicle registration data from Vahan dashboard.')
-    parser.add_argument('--refetch-missing', action='store_true', 
-                        help='Refetch files with missing data. By default, only fetches files that don\'t exist.')
     parser.add_argument('--fetch-all', action='store_true',
-                        help='Fetch all months from 2021 onwards. By default, only fetches previous month of current year.')
-    parser.add_argument('--reset-completed', action='store_true',
-                        help='Reset .completed.json')
+                        help='Fetch all months from 2021 onwards. By default, only fetches current month of current year.')
+    parser.add_argument('--no-debug', action='store_true',
+                        help='Disable debug logs. By default, debug logs are enabled.')
+    parser.add_argument('--years', nargs='+', type=str,
+                        help='Specify which years to fetch (e.g., --years 2024 2025). By default, only current year.')
+    parser.add_argument('--months', nargs='+', type=str,
+                        help='Specify which months to fetch (e.g., --months JAN FEB MAR). By default, only current month.')
+    parser.add_argument('--states', nargs='+', type=str,
+                        help='Specify which states to fetch (e.g., --states KA MH). By default, all states.')
+    parser.add_argument('--rtos', type=str,
+                        help='Specify RTOs to fetch as JSON mapping state to RTOs (e.g., \'{"KA": ["KA01", "KA02"], "MH": ["MH01"]}\'). By default, all RTOs.')
     args = parser.parse_args()
     
-    # Only delete blank files if --refetch-missing is set
-    if args.refetch_missing:
-        deleted_count = find_and_delete_blank_files()
-        logger.info(f"Deleted blank files")
-
-    # Delete .completed.json if --reset-completed is set
-    if args.reset_completed:
-        os.remove('.completed.json')
-        logger.info("Deleted .completed.json")
+    # Initialize logger with debug flag
+    logger = setup_logger(debug=not args.no_debug)
+    
+    # Determine default years and months (current month of current year)
+    current_date = datetime.datetime.now()
+    current_year = str(current_date.year)
+    current_month = MONTHS[current_date.month - 1] if current_date.month <= 12 else MONTHS[11]
+    
+    # Set years filter
+    if args.years:
+        years_filter = args.years
+    elif args.fetch_all:
+        years_filter = None  # All years
+    else:
+        years_filter = [current_year]  # Default: current year only
+    
+    # Set months filter
+    if args.months:
+        months_filter = [m.upper() for m in args.months]
+    elif args.fetch_all:
+        months_filter = None  # All months
+    else:
+        months_filter = [current_month]  # Default: current month only
+    
+    # Set states filter
+    states_filter = args.states if args.states else None
+    
+    # Parse RTOs filter
+    rtos_filter = None
+    if args.rtos:
+        try:
+            rtos_filter = json.loads(args.rtos)
+            # Convert RTO lists to sets for faster lookup
+            rtos_filter = {state: set(rtos) for state, rtos in rtos_filter.items()}
+        except json.JSONDecodeError:
+            logger.error(f"Invalid JSON format for --rtos: {args.rtos}")
+            exit(1)
+    
+    # Log filter settings
+    if years_filter:
+        logger.info(f"Years filter: {', '.join(years_filter)}")
+    else:
+        logger.info("Years filter: all years")
+    
+    if months_filter:
+        logger.info(f"Months filter: {', '.join(months_filter)}")
+    else:
+        logger.info("Months filter: all months")
+    
+    if states_filter:
+        logger.info(f"States filter: {', '.join(states_filter)}")
+    else:
+        logger.info("States filter: all states")
+    
+    if rtos_filter:
+        logger.info(f"RTOs filter: {len(rtos_filter)} states with specific RTOs")
+    else:
+        logger.info("RTOs filter: all RTOs")
     
     # Load existing completed fetches
     completed_fetches = load_completed_fetches()
@@ -1242,5 +1686,12 @@ if __name__ == "__main__":
     logger.info("Completed fetches tracking updated based on existing files")
 
     # Initialize and run the fetcher
-    fetcher = VahanFetcher(completed_fetches=completed_fetches, fetch_all=args.fetch_all)
+    fetcher = VahanFetcher(
+        completed_fetches=completed_fetches, 
+        fetch_all=args.fetch_all,
+        years_filter=years_filter,
+        months_filter=months_filter,
+        states_filter=states_filter,
+        rtos_filter=rtos_filter
+    )
     fetcher.run()
