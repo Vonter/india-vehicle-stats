@@ -14,7 +14,7 @@ import re
 
 # Global variables
 BUTTONS = {}
-YEARS = ['2025', '2024', '2023', '2022', '2021']
+YEARS = ['2026', '2025', '2024', '2023', '2022']
 MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC']
 STATES = [
     'KA',
